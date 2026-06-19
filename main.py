@@ -424,6 +424,10 @@ def track_and_redirect(cid: int, camp_id: int):
 
 # ── LINEウェブフック ──────────────────────────────────────────────────────────
 
+@app.get("/webhook/{cid}")
+async def webhook_verify(cid: int):
+    return {"status": "ok"}
+
 @app.post("/webhook/{cid}")
 async def webhook(cid: int, request: Request):
     body = await request.body()
@@ -461,6 +465,10 @@ def _handle_event(event: dict, company: dict):
         _on_follow(user_id, company)
     elif etype == "unfollow":
         _on_unfollow(user_id, company["id"])
+    elif etype == "message":
+        reply_token = event.get("replyToken", "")
+        msg = event.get("message", {})
+        _on_message(user_id, msg, reply_token, company)
 
 
 def _on_follow(user_id: str, company: dict):
@@ -756,5 +764,378 @@ def analytics(cid: int, s=Depends(get_session)):
 
 
 # ── 静的ファイル ──────────────────────────────────────────────────────────────
+
+
+
+def _on_message(user_id: str, msg: dict, reply_token: str, company: dict):
+    if msg.get("type") != "text":
+        return
+    text = msg.get("text", "").strip()
+    cid = company["id"]
+    token = company["line_channel_token"]
+
+    conn = get_db()
+    # キーワード照合
+    keywords = conn.execute(
+        "SELECT * FROM keyword_replies WHERE company_id=? AND is_active=1 ORDER BY id",
+        (cid,)
+    ).fetchall()
+
+    matched = None
+    for kw in keywords:
+        k = kw["keyword"]
+        mt = kw["match_type"]
+        if mt == "exact" and text == k:
+            matched = kw
+            break
+        elif mt == "contains" and k in text:
+            matched = kw
+            break
+        elif mt == "starts_with" and text.startswith(k):
+            matched = kw
+            break
+
+    if matched:
+        messages = [{"type": matched["reply_type"], "text": matched["reply_content"]}]
+        conn.close()
+        reply_message(reply_token, messages, token)
+        return
+
+    # デフォルト返信
+    default = conn.execute(
+        "SELECT * FROM default_replies WHERE company_id=? AND is_active=1",
+        (cid,)
+    ).fetchone()
+    conn.close()
+    if default:
+        reply_message(reply_token, [{"type": "text", "text": default["reply_content"]}], token)
+
+
+
+# ── キーワード自動応答 API ────────────────────────────────────────────────────
+
+class KeywordBody(BaseModel):
+    keyword: str
+    match_type: str = "contains"
+    reply_type: str = "text"
+    reply_content: str
+    is_active: int = 1
+
+class DefaultReplyBody(BaseModel):
+    reply_content: str
+    is_active: int = 1
+
+@app.get("/api/companies/{cid}/keywords")
+def list_keywords(cid: int, s=Depends(get_session)):
+    db = get_db()
+    rows = db.execute("SELECT * FROM keyword_replies WHERE company_id=? ORDER BY id", (cid,)).fetchall()
+    db.close()
+    return [dict(r) for r in rows]
+
+@app.post("/api/companies/{cid}/keywords")
+def create_keyword(cid: int, body: KeywordBody, s=Depends(get_session)):
+    db = get_db()
+    db.execute(
+        "INSERT INTO keyword_replies (company_id, keyword, match_type, reply_type, reply_content, is_active) VALUES (?,?,?,?,?,?)",
+        (cid, body.keyword, body.match_type, body.reply_type, body.reply_content, body.is_active)
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+@app.put("/api/companies/{cid}/keywords/{kid}")
+def update_keyword(cid: int, kid: int, body: KeywordBody, s=Depends(get_session)):
+    db = get_db()
+    db.execute(
+        "UPDATE keyword_replies SET keyword=?, match_type=?, reply_type=?, reply_content=?, is_active=? WHERE id=? AND company_id=?",
+        (body.keyword, body.match_type, body.reply_type, body.reply_content, body.is_active, kid, cid)
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+@app.delete("/api/companies/{cid}/keywords/{kid}")
+def delete_keyword(cid: int, kid: int, s=Depends(get_session)):
+    db = get_db()
+    db.execute("DELETE FROM keyword_replies WHERE id=? AND company_id=?", (kid, cid))
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+@app.get("/api/companies/{cid}/default-reply")
+def get_default_reply(cid: int, s=Depends(get_session)):
+    db = get_db()
+    row = db.execute("SELECT * FROM default_replies WHERE company_id=?", (cid,)).fetchone()
+    db.close()
+    return dict(row) if row else {}
+
+@app.post("/api/companies/{cid}/default-reply")
+def save_default_reply(cid: int, body: DefaultReplyBody, s=Depends(get_session)):
+    db = get_db()
+    db.execute(
+        "INSERT INTO default_replies (company_id, reply_content, is_active) VALUES (?,?,?) "
+        "ON CONFLICT(company_id) DO UPDATE SET reply_content=excluded.reply_content, is_active=excluded.is_active",
+        (cid, body.reply_content, body.is_active)
+    )
+    db.commit()
+    db.close()
+    return {"ok": True}
+
+
+
+# ── 移行ツール API ────────────────────────────────────────────────────────────
+
+import csv, io, time as _time
+from line_api import get_all_follower_ids
+
+@app.post("/api/companies/{cid}/import/line-sync")
+async def import_line_sync(cid: int, s=Depends(get_session)):
+    """LINE APIから全フォロワーIDを取得してインポート（プロフィールも取得）"""
+    conn = get_db()
+    company = conn.execute("SELECT * FROM companies WHERE id=?", (cid,)).fetchone()
+    if not company:
+        conn.close()
+        raise HTTPException(status_code=404)
+
+    token = company["line_channel_token"]
+    user_ids = get_all_follower_ids(token)
+
+    added = 0
+    updated = 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for i, uid in enumerate(user_ids):
+        # プロフィール取得（10件ごとに0.1秒待機してレート制限回避）
+        if i > 0 and i % 10 == 0:
+            _time.sleep(0.1)
+
+        profile = get_profile(uid, token) or {}
+        display_name = profile.get("displayName", "")
+        picture_url = profile.get("pictureUrl", "")
+
+        existing = conn.execute(
+            "SELECT id FROM followers WHERE company_id=? AND line_user_id=?", (cid, uid)
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                "UPDATE followers SET display_name=COALESCE(NULLIF(?,''), display_name), picture_url=COALESCE(NULLIF(?,''), picture_url) WHERE id=?",
+                (display_name, picture_url, existing["id"])
+            )
+            updated += 1
+        else:
+            conn.execute(
+                """INSERT INTO followers (company_id, line_user_id, display_name, picture_url, follow_at)
+                   VALUES (?,?,?,?,?)""",
+                (cid, uid, display_name, picture_url, now)
+            )
+            added += 1
+
+        if (added + updated) % 50 == 0:
+            conn.commit()
+
+    conn.commit()
+    conn.close()
+    return {"added": added, "updated": updated, "total": len(user_ids)}
+
+
+class ScenarioStepImport(BaseModel):
+    delay_hours: int = 0
+    message_type: str = "text"
+    message_content: str
+    label: Optional[str] = None  # 表示用ラベル（省略可）
+
+class ScenarioImportBody(BaseModel):
+    name: str
+    description: str = ""
+    steps: list
+    assign_to_existing: bool = False
+    start_from_step: int = 1  # 既存フォロワーへの割り当て開始ステップ
+
+@app.post("/api/companies/{cid}/import/scenario")
+def import_scenario(cid: int, body: ScenarioImportBody, s=Depends(get_session)):
+    """シナリオとステップをJSON一括インポート"""
+    if not body.steps:
+        raise HTTPException(400, detail="ステップが1件もありません")
+
+    conn = get_db()
+    company = conn.execute("SELECT id FROM companies WHERE id=?", (cid,)).fetchone()
+    if not company:
+        conn.close()
+        raise HTTPException(404)
+
+    cur = conn.execute(
+        "INSERT INTO scenarios (company_id, name, description) VALUES (?,?,?)",
+        (cid, body.name, body.description)
+    )
+    sid = cur.lastrowid
+
+    for i, step in enumerate(body.steps):
+        conn.execute(
+            """INSERT INTO scenario_steps (scenario_id, step_order, delay_hours, message_type, message_content)
+               VALUES (?,?,?,?,?)""",
+            (sid, i + 1,
+             int(step.get("delay_hours", 0)),
+             step.get("message_type", "text"),
+             step.get("message_content", ""))
+        )
+    conn.commit()
+
+    assigned = 0
+    if body.assign_to_existing:
+        followers = conn.execute(
+            "SELECT id FROM followers WHERE company_id=? AND status='active'", (cid,)
+        ).fetchall()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # 開始ステップを調整（指定ステップから配信開始するため過去扱いにする）
+        start_step = max(1, body.start_from_step)
+        step_rows = conn.execute(
+            "SELECT id, step_order, delay_hours FROM scenario_steps WHERE scenario_id=? ORDER BY step_order",
+            (sid,)
+        ).fetchall()
+        offset_hours = next((s["delay_hours"] for s in step_rows if s["step_order"] == start_step), 0)
+
+        for f in followers:
+            fid = f["id"]
+            existing_fs = conn.execute(
+                "SELECT id FROM follower_scenarios WHERE follower_id=? AND scenario_id=?",
+                (fid, sid)
+            ).fetchone()
+            if existing_fs:
+                continue
+            conn.execute(
+                "INSERT INTO follower_scenarios (follower_id, scenario_id) VALUES (?,?)",
+                (fid, sid)
+            )
+            conn.commit()
+
+            # 指定ステップ以降のみスケジュール
+            from scheduler import schedule_steps_for_follower
+            schedule_steps_for_follower(fid, sid, now, start_step=start_step)
+            assigned += 1
+
+    conn.close()
+    return {"scenario_id": sid, "steps_created": len(body.steps), "assigned": assigned}
+
+
+@app.post("/api/companies/{cid}/import/followers-csv")
+async def import_followers_csv(cid: int, request: Request, s=Depends(get_session)):
+    """CSVからフォロワーをインポート（かんたんLINEステップのエクスポートCSV対応）
+    
+    必須列: line_user_id（またはユーザーID/userId/user_id）
+    任意列: display_name, tags（カンマ区切り）, follow_at, memo
+    """
+    conn = get_db()
+    company = conn.execute("SELECT id FROM companies WHERE id=?", (cid,)).fetchone()
+    if not company:
+        conn.close()
+        raise HTTPException(404)
+
+    body = await request.body()
+    try:
+        text = body.decode("utf-8-sig")  # BOM付きUTF-8対応
+    except Exception:
+        text = body.decode("shift_jis", errors="replace")
+
+    reader = csv.DictReader(io.StringIO(text))
+
+    # 列名の正規化マップ
+    COL_USER_ID = {"line_user_id", "userid", "user_id", "ユーザーid", "line userid", "lineid"}
+    COL_NAME    = {"display_name", "name", "表示名", "名前"}
+    COL_TAGS    = {"tags", "タグ", "tag"}
+    COL_DATE    = {"follow_at", "follow_date", "友達追加日", "registered_at", "登録日"}
+    COL_MEMO    = {"memo", "メモ", "note", "notes"}
+
+    def find_col(headers, candidates):
+        for h in headers:
+            if h.strip().lower() in candidates:
+                return h
+        return None
+
+    headers = reader.fieldnames or []
+    col_uid  = find_col(headers, COL_USER_ID)
+    col_name = find_col(headers, COL_NAME)
+    col_tags = find_col(headers, COL_TAGS)
+    col_date = find_col(headers, COL_DATE)
+    col_memo = find_col(headers, COL_MEMO)
+
+    if not col_uid:
+        conn.close()
+        raise HTTPException(400, detail=f"ユーザーID列が見つかりません。列名: {headers}")
+
+    added = 0
+    skipped = 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for row in reader:
+        uid = (row.get(col_uid) or "").strip()
+        if not uid or not uid.startswith("U"):
+            skipped += 1
+            continue
+
+        display_name = row.get(col_name, "").strip() if col_name else ""
+        memo = row.get(col_memo, "").strip() if col_memo else ""
+        follow_at = row.get(col_date, now).strip() if col_date else now
+        if not follow_at:
+            follow_at = now
+
+        raw_tags = row.get(col_tags, "").strip() if col_tags else ""
+        tags_list = [t.strip() for t in raw_tags.split(",") if t.strip()] if raw_tags else []
+        tags_json = __import__("json").dumps(tags_list, ensure_ascii=False)
+
+        existing = conn.execute(
+            "SELECT id FROM followers WHERE company_id=? AND line_user_id=?", (cid, uid)
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                "UPDATE followers SET display_name=COALESCE(NULLIF(?,''), display_name), tags=?, memo=COALESCE(NULLIF(?,''), memo) WHERE id=?",
+                (display_name, tags_json, memo, existing["id"])
+            )
+            skipped += 1
+        else:
+            conn.execute(
+                """INSERT INTO followers (company_id, line_user_id, display_name, tags, memo, follow_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (cid, uid, display_name, tags_json, memo, follow_at)
+            )
+            added += 1
+
+        if (added + skipped) % 100 == 0:
+            conn.commit()
+
+    conn.commit()
+    conn.close()
+    return {"added": added, "skipped": skipped, "columns_detected": {
+        "user_id": col_uid, "name": col_name, "tags": col_tags,
+        "follow_at": col_date, "memo": col_memo
+    }}
+
+
+# ── 本部ポータル自動ログイン ─────────────────────────────────────────────────
+AUTO_LOGIN_KEY_LS = "starq-honbu-2025"
+
+@app.get("/auto-login", response_class=HTMLResponse)
+def auto_login_linestep(key: str = ""):
+    if key != AUTO_LOGIN_KEY_LS:
+        return HTMLResponse('<html><body style="background:#0d0d0d;color:white"><h2>アクセスできません</h2></body></html>', status_code=403)
+    db = get_db()
+    admin = db.execute("SELECT * FROM admins LIMIT 1").fetchone()
+    db.close()
+    if not admin:
+        return HTMLResponse('<html><body>エラー</body></html>', status_code=500)
+    token = secrets.token_hex(32)
+    sessions[token] = {"admin_id": admin["id"], "username": admin["username"]}
+    html = (
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<script>"
+        "localStorage.setItem('ls_token', '" + token + "');"
+        "window.location.href = '/linestep/';"
+        "</script>"
+        "</head><body style='background:#0d0d0d;color:white'><p>ログイン中...</p></body></html>"
+    )
+    return HTMLResponse(html)
+
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")

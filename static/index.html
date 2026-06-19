@@ -4,7 +4,87 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LINEステップ管理</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js">
+
+// ── データ移行 ──────────────────────────────────────────────
+
+function loadMigrate() {
+  // 特にロードするものはない（静的UI）
+}
+
+async function runLineSync() {
+  if (!currentCompanyId) return alert('会社を選択してください');
+  const btn = document.getElementById('btn-line-sync');
+  const res = document.getElementById('line-sync-result');
+  btn.disabled = true;
+  btn.textContent = '⏳ 同期中... (数分かかる場合があります)';
+  res.innerHTML = '';
+  try {
+    const r = await api('POST', `/api/companies/${currentCompanyId}/import/line-sync`);
+    res.innerHTML = `<div style="padding:12px;background:rgba(6,199,85,0.1);border-radius:6px;color:#06C755;font-size:13px;">
+      ✅ 完了！ 新規追加: <strong>${r.added}</strong>件 / 更新: <strong>${r.updated}</strong>件 / 合計: <strong>${r.total}</strong>件
+    </div>`;
+    loadFollowers();
+  } catch(e) {
+    res.innerHTML = `<div style="padding:12px;background:rgba(239,68,68,0.1);border-radius:6px;color:#ef4444;font-size:13px;">❌ ${e.message}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '🔄 友達リストを同期する';
+  }
+}
+
+async function uploadCsv() {
+  if (!currentCompanyId) return alert('会社を選択してください');
+  const file = document.getElementById('csv-file').files[0];
+  if (!file) return alert('CSVファイルを選択してください');
+  const res = document.getElementById('csv-result');
+  res.innerHTML = '<span style="color:var(--text-sub);font-size:13px;">⏳ 処理中...</span>';
+
+  const text = await file.text();
+  const opts = {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/csv' },
+    body: text
+  };
+  try {
+    const r = await fetch(BASE + `/api/companies/${currentCompanyId}/import/followers-csv`, opts);
+    if (!r.ok) {
+      const e = await r.json().catch(() => ({}));
+      throw new Error(e.detail || 'エラーが発生しました');
+    }
+    const d = await r.json();
+    const cols = Object.entries(d.columns_detected).filter(([,v])=>v).map(([k,v])=>`${k}→${v}`).join(', ');
+    res.innerHTML = `<div style="padding:12px;background:rgba(6,199,85,0.1);border-radius:6px;color:#06C755;font-size:13px;">
+      ✅ 完了！ 新規追加: <strong>${d.added}</strong>件 / スキップ: <strong>${d.skipped}</strong>件<br>
+      <span style="font-size:11px;opacity:0.8;">検出列: ${cols || 'なし'}</span>
+    </div>`;
+    loadFollowers();
+  } catch(e) {
+    res.innerHTML = `<div style="padding:12px;background:rgba(239,68,68,0.1);border-radius:6px;color:#ef4444;font-size:13px;">❌ ${e.message}</div>`;
+  }
+}
+
+async function importScenario() {
+  if (!currentCompanyId) return alert('会社を選択してください');
+  const raw = document.getElementById('scenario-json').value.trim();
+  if (!raw) return alert('JSONを入力してください');
+  const res = document.getElementById('scenario-result');
+  res.innerHTML = '<span style="color:var(--text-sub);font-size:13px;">⏳ 処理中...</span>';
+  try {
+    const body = JSON.parse(raw);
+    const r = await api('POST', `/api/companies/${currentCompanyId}/import/scenario`, body);
+    res.innerHTML = `<div style="padding:12px;background:rgba(6,199,85,0.1);border-radius:6px;color:#06C755;font-size:13px;">
+      ✅ 完了！ シナリオID: <strong>${r.scenario_id}</strong> / ステップ: <strong>${r.steps_created}</strong>件
+      ${r.assigned > 0 ? ` / 既存フォロワーへの割り当て: <strong>${r.assigned}</strong>件` : ''}
+    </div>`;
+    document.getElementById('scenario-json').value = '';
+  } catch(e) {
+    res.innerHTML = `<div style="padding:12px;background:rgba(239,68,68,0.1);border-radius:6px;color:#ef4444;font-size:13px;">❌ ${e.message || 'JSONの形式が正しくありません'}</div>`;
+  }
+}
+
+
+</script>
 <style>
 :root {
   --line-green: #06C755;
@@ -326,7 +406,7 @@ tr:hover td { background: #fafbfc; }
         </div>
       </div>
       <div class="company-select-wrap">
-        <label>テナント（会社）</label>
+        <label>会社選択</label>
         <select id="company-select" onchange="onCompanyChange()">
           <option value="">-- 会社を選択 --</option>
         </select>
@@ -349,11 +429,19 @@ tr:hover td { background: #fafbfc; }
         <div class="nav-item" data-page="broadcast" onclick="showPage('broadcast')">
           <span class="icon">📣</span> セグメント配信
         </div>
+        <div class="nav-section">自動応答</div>
+        <div class="nav-item" data-page="keywords" onclick="showPage('keywords')">
+          <span class="icon">&#x1F4AC;</span> キーワード応答
+        </div>
+        <div class="nav-section">移行・データ</div>
+        <div class="nav-item" data-page="migrate" onclick="showPage('migrate')">
+          <span class="icon">📥</span> データ移行
+        </div>
         <div class="nav-section">分析・設定</div>
         <div class="nav-item" data-page="analytics" onclick="showPage('analytics')">
           <span class="icon">📈</span> 詳細分析
         </div>
-        <div class="nav-item" data-page="tenants" onclick="showPage('tenants')">
+        <div class="nav-item" data-page="tenants" onclick="showPage('tenants')" style="display:none">
           <span class="icon">🏢</span> テナント設定
         </div>
       </nav>
@@ -544,6 +632,106 @@ tr:hover td { background: #fafbfc; }
         </div>
 
         <!-- テナント設定 -->
+        <!-- 自動応答 -->
+        <div id="page-keywords" class="page">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;max-width:900px">
+            <div>
+              <div class="card">
+                <div class="card-header">
+                  <div class="card-title">キーワード応答</div>
+                  <button class="btn btn-green btn-sm" onclick="showKeywordModal()">+ 追加</button>
+                </div>
+                <div id="keywords-list" style="margin-top:8px"></div>
+              </div>
+            </div>
+            <div>
+              <div class="card">
+                <div class="card-title" style="margin-bottom:12px">デフォルト返信</div>
+                <p style="font-size:12px;color:var(--text-muted);margin-bottom:12px">キーワードに一致しない場合に自動返信します</p>
+                <textarea id="default-reply-text" rows="4" placeholder="例：お問い合わせありがとうございます。" style="width:100%;background:var(--bg-input);border:1px solid var(--border);color:white;padding:8px;font-size:13px;resize:vertical;font-family:inherit;box-sizing:border-box"></textarea>
+                <div style="display:flex;align-items:center;gap:12px;margin-top:10px">
+                  <label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer">
+                    <input type="checkbox" id="default-reply-active" style="width:16px;height:16px"> 有効にする
+                  </label>
+                  <button class="btn btn-green btn-sm" onclick="saveDefaultReply()">保存</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+
+        <div id="page-migrate" class="page">
+          <div style="max-width:800px;margin:0 auto;display:flex;flex-direction:column;gap:24px;">
+
+            <!-- LINE API同期 -->
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">① LINE API から友達リストを同期</div>
+              </div>
+              <div class="card-body">
+                <p style="color:var(--text-sub);font-size:13px;margin-bottom:16px;">
+                  選択中の会社のチャネルアクセストークンを使って、現在の友達全員を取得します。<br>
+                  既存の友達はスキップ、新規のみ追加されます。プロフィール取得のため数分かかる場合があります。
+                </p>
+                <button class="btn btn-green" onclick="runLineSync()" id="btn-line-sync">🔄 友達リストを同期する</button>
+                <div id="line-sync-result" style="margin-top:12px;"></div>
+              </div>
+            </div>
+
+            <!-- CSV取り込み -->
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">② かんたんLINEステップのCSVを取り込み</div>
+              </div>
+              <div class="card-body">
+                <p style="color:var(--text-sub);font-size:13px;margin-bottom:16px;">
+                  かんたんLINEステップの管理画面 → 友達一覧 → CSVエクスポートしたファイルをアップロードしてください。<br>
+                  <strong>対応列：</strong> ユーザーID・表示名・タグ・友達追加日・メモ（列名は自動判定）
+                </p>
+                <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
+                  <input type="file" id="csv-file" accept=".csv" style="font-size:13px;">
+                  <button class="btn btn-green" onclick="uploadCsv()">📂 インポート</button>
+                </div>
+                <div id="csv-result" style="margin-top:12px;"></div>
+              </div>
+            </div>
+
+            <!-- シナリオJSON取り込み -->
+            <div class="card">
+              <div class="card-header">
+                <div class="card-title">③ シナリオをJSON形式でインポート</div>
+              </div>
+              <div class="card-body">
+                <p style="color:var(--text-sub);font-size:13px;margin-bottom:8px;">
+                  かんたんLINEステップのシナリオ設定を以下のJSON形式で貼り付けてください。<br>
+                  delay_hours は <strong>友達追加から何時間後</strong> に送信するかの累積時間です（例：24=1日後、72=3日後）
+                </p>
+                <div style="background:rgba(255,255,255,0.04);border-radius:6px;padding:12px;font-size:12px;color:var(--text-sub);margin-bottom:12px;font-family:monospace;white-space:pre;">{
+  "name": "ステップシナリオ名",
+  "description": "説明（省略可）",
+  "assign_to_existing": true,
+  "start_from_step": 1,
+  "steps": [
+    {"delay_hours": 0,  "message_type": "text", "message_content": "友達追加ありがとうございます！"},
+    {"delay_hours": 24, "message_type": "text", "message_content": "1日後のメッセージ"},
+    {"delay_hours": 72, "message_type": "text", "message_content": "3日後のメッセージ"}
+  ]
+}</div>
+                <div style="margin-bottom:8px;font-size:12px;color:var(--text-sub);">
+                  assign_to_existing: true にすると既存の全友達にも配信開始。start_from_step で何ステップ目から始めるかを指定できます。
+                </div>
+                <textarea id="scenario-json" style="width:100%;height:200px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:6px;color:white;padding:12px;font-family:monospace;font-size:12px;resize:vertical;" placeholder="JSONをここに貼り付け..."></textarea>
+                <div style="margin-top:12px;">
+                  <button class="btn btn-green" onclick="importScenario()">📋 シナリオをインポート</button>
+                </div>
+                <div id="scenario-result" style="margin-top:12px;"></div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+
         <div id="page-tenants" class="page">
           <div id="tenants-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;"></div>
         </div>
@@ -668,6 +856,8 @@ function showPage(name) {
     campaigns:  '流入経路',
     broadcast:  'セグメント配信',
     analytics:  '詳細分析',
+    migrate:    'データ移行',
+    keywords:   'キーワード自動応答',
     tenants:    'テナント設定',
   };
   document.getElementById('page-title').textContent = titles[name] || name;
@@ -688,7 +878,9 @@ function loadPageData(name) {
   else if (name === 'scenarios') loadScenarios();
   else if (name === 'campaigns') loadCampaigns();
   else if (name === 'broadcast') loadBroadcast();
+  else if (name === 'keywords') loadKeywords();
   else if (name === 'analytics') loadAnalytics();
+  else if (name === 'migrate') loadMigrate();
   else if (name === 'tenants') loadTenants();
 }
 
@@ -1438,6 +1630,107 @@ if (token) {
     token = '';
   });
 }
+// keyword auto-reply
+async function loadKeywords() {
+  if (!currentCompanyId) return;
+  const rows = await api('GET', '/api/companies/' + currentCompanyId + '/keywords');
+  const el = document.getElementById('keywords-list');
+  const matchLabels = {exact:'完全一致', contains:'含む', starts_with:'前方一致'};
+  if (!rows || rows.length === 0) {
+    el.innerHTML = '<p style="color:var(--text-muted);font-size:13px;padding:8px 0">キーワードが未設定です</p>';
+  } else {
+    el.innerHTML = rows.map(function(r) {
+      var preview = r.reply_content.length > 40 ? r.reply_content.slice(0,40) + '...' : r.reply_content;
+      return '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border)">'
+        + '<div><span style="font-size:13px;font-weight:600">' + r.keyword + '</span>'
+        + '<span style="font-size:11px;color:var(--text-muted);margin-left:6px">' + (matchLabels[r.match_type]||r.match_type) + '</span>'
+        + (r.is_active ? '' : '<span style="font-size:10px;background:#333;padding:2px 6px;margin-left:4px">無効</span>')
+        + '<div style="font-size:12px;color:var(--text-muted);margin-top:2px">' + preview + '</div></div>'
+        + '<div style="display:flex;gap:6px;flex-shrink:0">'
+        + '<button class="btn btn-outline btn-sm" onclick="editKeyword(' + r.id + ')">編集</button>'
+        + '<button class="btn btn-sm" style="background:#c0392b;color:white" onclick="deleteKeyword(' + r.id + ')">削除</button>'
+        + '</div></div>';
+    }).join('');
+  }
+  const def = await api('GET', '/api/companies/' + currentCompanyId + '/default-reply');
+  if (def && def.reply_content) {
+    document.getElementById('default-reply-text').value = def.reply_content;
+    document.getElementById('default-reply-active').checked = !!def.is_active;
+  }
+}
+
+var _editingKeywordId = null;
+function showKeywordModal(existing) {
+  _editingKeywordId = existing ? existing.id : null;
+  var kw = existing ? existing.keyword : '';
+  var mt = existing ? existing.match_type : 'contains';
+  var rc = existing ? existing.reply_content : '';
+  var ac = (!existing || existing.is_active) ? 'checked' : '';
+  var html = '<div class="modal-overlay" onclick="if(event.target===this)closeModal()">'
+    + '<div class="modal" onclick="event.stopPropagation()">'
+    + '<div class="modal-header"><div class="modal-title">' + (existing ? 'キーワード編集' : 'キーワード追加') + '</div>'
+    + '<button class="modal-close" onclick="closeModal()">x</button></div>'
+    + '<div style="display:flex;flex-direction:column;gap:12px;margin-top:16px">'
+    + '<div><label style="font-size:12px;color:var(--text-muted)">キーワード</label>'
+    + '<input id="kw-keyword" value="' + kw + '" placeholder="例：価格、料金" style="width:100%;background:var(--bg-input);border:1px solid var(--border);color:white;padding:8px;font-size:13px;margin-top:4px;box-sizing:border-box"></div>'
+    + '<div><label style="font-size:12px;color:var(--text-muted)">マッチ方法</label>'
+    + '<select id="kw-match" style="width:100%;background:var(--bg-input);border:1px solid var(--border);color:white;padding:8px;font-size:13px;margin-top:4px">'
+    + '<option value="contains"' + (mt==='contains'?' selected':'') + '>含む（部分一致）</option>'
+    + '<option value="exact"' + (mt==='exact'?' selected':'') + '>完全一致</option>'
+    + '<option value="starts_with"' + (mt==='starts_with'?' selected':'') + '>前方一致</option>'
+    + '</select></div>'
+    + '<div><label style="font-size:12px;color:var(--text-muted)">返信メッセージ</label>'
+    + '<textarea id="kw-reply" rows="4" placeholder="例：料金についてはこちら→" style="width:100%;background:var(--bg-input);border:1px solid var(--border);color:white;padding:8px;font-size:13px;margin-top:4px;resize:vertical;font-family:inherit;box-sizing:border-box">' + rc + '</textarea></div>'
+    + '<label style="display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer">'
+    + '<input type="checkbox" id="kw-active" ' + ac + ' style="width:16px;height:16px"> 有効にする</label>'
+    + '<button class="btn btn-green" onclick="saveKeyword()">保存</button>'
+    + '</div></div></div>';
+  document.getElementById('modal-container').innerHTML = html;
+}
+
+async function editKeyword(id) {
+  var rows = await api('GET', '/api/companies/' + currentCompanyId + '/keywords');
+  var existing = rows ? rows.find(function(r){ return r.id === id; }) : null;
+  if (existing) showKeywordModal(existing);
+}
+
+async function saveKeyword() {
+  var body = {
+    keyword:       document.getElementById('kw-keyword').value.trim(),
+    match_type:    document.getElementById('kw-match').value,
+    reply_type:    'text',
+    reply_content: document.getElementById('kw-reply').value.trim(),
+    is_active:     document.getElementById('kw-active').checked ? 1 : 0
+  };
+  if (!body.keyword || !body.reply_content) { showToast('キーワードと返信を入力してください', true); return; }
+  try {
+    if (_editingKeywordId) {
+      await api('PUT', '/api/companies/' + currentCompanyId + '/keywords/' + _editingKeywordId, body);
+    } else {
+      await api('POST', '/api/companies/' + currentCompanyId + '/keywords', body);
+    }
+    closeModal();
+    loadKeywords();
+    showToast(_editingKeywordId ? '更新しました' : '追加しました');
+  } catch(e) {
+    showToast('エラー: ' + e.message, true);
+  }
+}
+
+async function deleteKeyword(id) {
+  if (!confirm('削除しますか？')) return;
+  await api('DELETE', '/api/companies/' + currentCompanyId + '/keywords/' + id);
+  loadKeywords();
+  showToast('削除しました');
+}
+
+async function saveDefaultReply() {
+  var txt = document.getElementById('default-reply-text').value.trim();
+  var active = document.getElementById('default-reply-active').checked ? 1 : 0;
+  await api('POST', '/api/companies/' + currentCompanyId + '/default-reply', { reply_content: txt || ' ', is_active: active });
+  showToast('デフォルト返信を保存しました');
+}
+
 </script>
 </body>
 </html>

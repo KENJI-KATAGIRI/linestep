@@ -6,7 +6,7 @@ from line_api import build_message, push_message
 _scheduler = BackgroundScheduler(timezone="Asia/Tokyo")
 
 
-def schedule_steps_for_follower(follower_id: int, scenario_id: int, follow_at: str):
+def schedule_steps_for_follower(follower_id: int, scenario_id: int, follow_at: str, start_step: int = 1):
     conn = get_db()
     try:
         steps = conn.execute(
@@ -25,6 +25,8 @@ def schedule_steps_for_follower(follower_id: int, scenario_id: int, follow_at: s
         cumulative_hours = 0
 
         for step in steps:
+            if step["step_order"] < start_step:
+                continue
             cumulative_hours += step["delay_hours"]
             send_at = base_time + timedelta(hours=cumulative_hours)
 

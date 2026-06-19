@@ -85,3 +85,25 @@ def build_message(msg_type: str, content: str) -> dict:
         except Exception:
             return {"type": "text", "text": "[flex error]"}
     return {"type": "text", "text": content}
+
+
+def get_all_follower_ids(token: str) -> list:
+    """LINE APIから全フォロワーのuserIDを取得（ページネーション対応）"""
+    ids = []
+    url = f"{LINE_API_BASE}/followers/ids?count=300"
+    while url:
+        req = urllib.request.Request(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = json.loads(r.read())
+                ids.extend(data.get("userIds", []))
+                nxt = data.get("next")
+                url = f"{LINE_API_BASE}/followers/ids?count=300&start={nxt}" if nxt else None
+        except Exception as e:
+            print(f"LINE followers/ids error: {e}")
+            break
+    return ids
