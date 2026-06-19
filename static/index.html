@@ -33,35 +33,153 @@ async function runLineSync() {
   }
 }
 
-async function uploadCsv() {
-  if (!currentCompanyId) return alert('会社を選択してください');
-  const file = document.getElementById('csv-file').files[0];
-  if (!file) return alert('CSVファイルを選択してください');
-  const res = document.getElementById('csv-result');
-  res.innerHTML = '<span style="color:var(--text-sub);font-size:13px;">⏳ 処理中...</span>';
+// CSV column auto-detection (mirrors server logic)
+const CSV_UID_COLS  = new Set(["line_user_id","userid","user_id","ユーザーid","line userid","lineid"]);
+const CSV_NAME_COLS = new Set(["display_name","name","表示名","名前"]);
+const CSV_TAG_COLS  = new Set(["tags","タグ","tag"]);
+const CSV_DATE_COLS = new Set(["follow_at","follow_date","友達追加日","registered_at","登録日"]);
+const CSV_MEMO_COLS = new Set(["memo","メモ","note","notes"]);
 
-  const text = await file.text();
-  const opts = {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/csv' },
-    body: text
+function csvAutoDetect(header) {
+  const detect = (candidates) => {
+    for (const h of header) if (candidates.has(h.trim().toLowerCase())) return h;
+    return "";
   };
+  return {
+    uid:  detect(CSV_UID_COLS),
+    name: detect(CSV_NAME_COLS),
+    tags: detect(CSV_TAG_COLS),
+    date: detect(CSV_DATE_COLS),
+    memo: detect(CSV_MEMO_COLS),
+  };
+}
+
+let csvFileText = "";
+let csvHeaders  = [];
+
+async function onCsvFileChange(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const res = document.getElementById('csv-result');
+  res.innerHTML = '';
   try {
-    const r = await fetch(BASE + `/api/companies/${currentCompanyId}/import/followers-csv`, opts);
+    const buf = await file.arrayBuffer();
+    // Try UTF-8 BOM first, then Shift-JIS
+    let text;
+    try {
+      text = new TextDecoder('utf-8').decode(buf);
+    } catch(e) {
+      text = new TextDecoder('shift-jis').decode(buf);
+    }
+    csvFileText = text;
+    // Parse header row
+    const firstLine = text.split(/\r?\n/)[0];
+    csvHeaders = firstLine.split(',').map(h => h.replace(/^"(.*)"$/, '$1').trim());
+    showCsvMapper(csvHeaders, res);
+  } catch(e) {
+    res.innerHTML = `<div style="color:#ef4444;font-size:13px;">❌ ファイルの読み込みエラー: ${e.message}</div>`;
+  }
+}
+
+function showCsvMapper(headers, container) {
+  const auto = csvAutoDetect(headers);
+  const roles = [
+    { key: 'uid',  label: 'LINE ユーザーID（必須）' },
+    { key: 'name', label: '表示名' },
+    { key: 'tags', label: 'タグ' },
+    { key: 'date', label: '友達追加日' },
+    { key: 'memo', label: 'メモ' },
+  ];
+  const allDetected = roles.every(r => r.key === 'uid' ? auto[r.key] : true);
+
+  let html = `<div style="margin-top:12px;padding:12px;background:rgba(255,255,255,0.05);border-radius:8px;border:1px solid rgba(255,255,255,0.1);">
+    <div style="font-size:13px;font-weight:600;margin-bottom:10px;color:var(--text-sub);">📊 列マッピング（${headers.length}列検出）</div>
+    <table style="width:100%;font-size:12px;border-collapse:collapse;">
+      <thead><tr>
+        <th style="text-align:left;padding:4px 8px;color:var(--text-sub);border-bottom:1px solid rgba(255,255,255,0.1);">CSVの列名</th>
+        <th style="text-align:left;padding:4px 8px;color:var(--text-sub);border-bottom:1px solid rgba(255,255,255,0.1);">データの意味</th>
+      </tr></thead>
+      <tbody>`;
+
+  for (const h of headers) {
+    // Determine auto-assigned role for this column
+    let autoRole = "";
+    for (const r of roles) {
+      if (auto[r.key] === h) { autoRole = r.key; break; }
+    }
+    html += `<tr>
+      <td style="padding:5px 8px;font-family:monospace;color:#06C755;">${escHtml(h)}</td>
+      <td style="padding:5px 8px;">
+        <select id="colmap-${escHtml(h)}" style="background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.15);border-radius:4px;color:white;padding:3px 6px;font-size:12px;width:100%;">
+          <option value="" ${!autoRole ? 'selected' : ''}>（無視）</option>
+          ${roles.map(r => `<option value="${r.key}" ${autoRole === r.key ? 'selected' : ''}>${r.label}</option>`).join('')}
+        </select>
+      </td>
+    </tr>`;
+  }
+
+  html += `</tbody></table>
+    <div style="margin-top:12px;display:flex;gap:10px;align-items:center;">
+      <button class="btn btn-green" onclick="submitCsvImport()">📂 このマッピングでインポート</button>
+      ${auto.uid ? '<span style="font-size:11px;color:#06C755;">✅ ユーザーID列を自動検出しました</span>' : '<span style="font-size:11px;color:#f59e0b;">⚠️ ユーザーID列を手動で指定してください</span>'}
+    </div>
+  </div>`;
+
+  container.innerHTML = html;
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function submitCsvImport() {
+  if (!currentCompanyId) return alert('会社を選択してください');
+  const res = document.getElementById('csv-result');
+
+  // Collect mapping from selects
+  const mapping = {};
+  for (const h of csvHeaders) {
+    const sel = document.getElementById(`colmap-${escHtml(h)}`);
+    if (sel && sel.value) mapping[sel.value] = h;
+  }
+
+  if (!mapping.uid) {
+    alert('LINE ユーザーID の列を選択してください');
+    return;
+  }
+
+  res.innerHTML = '<span style="color:var(--text-sub);font-size:13px;">⏳ インポート中...</span>';
+
+  const params = new URLSearchParams();
+  if (mapping.uid)  params.set('col_uid',  mapping.uid);
+  if (mapping.name) params.set('col_name', mapping.name);
+  if (mapping.tags) params.set('col_tags', mapping.tags);
+  if (mapping.date) params.set('col_date', mapping.date);
+  if (mapping.memo) params.set('col_memo', mapping.memo);
+
+  try {
+    const r = await fetch(BASE + `/api/companies/${currentCompanyId}/import/followers-csv?${params}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'text/csv' },
+      body: csvFileText
+    });
     if (!r.ok) {
       const e = await r.json().catch(() => ({}));
       throw new Error(e.detail || 'エラーが発生しました');
     }
     const d = await r.json();
-    const cols = Object.entries(d.columns_detected).filter(([,v])=>v).map(([k,v])=>`${k}→${v}`).join(', ');
     res.innerHTML = `<div style="padding:12px;background:rgba(6,199,85,0.1);border-radius:6px;color:#06C755;font-size:13px;">
-      ✅ 完了！ 新規追加: <strong>${d.added}</strong>件 / スキップ: <strong>${d.skipped}</strong>件<br>
-      <span style="font-size:11px;opacity:0.8;">検出列: ${cols || 'なし'}</span>
+      ✅ 完了！ 新規追加: <strong>${d.added}</strong>件 / スキップ(更新): <strong>${d.skipped}</strong>件
     </div>`;
     loadFollowers();
   } catch(e) {
     res.innerHTML = `<div style="padding:12px;background:rgba(239,68,68,0.1);border-radius:6px;color:#ef4444;font-size:13px;">❌ ${e.message}</div>`;
   }
+}
+
+async function uploadCsv() {
+  // Legacy: triggered if old button still used
+  await submitCsvImport();
 }
 
 async function importScenario() {
@@ -690,8 +808,8 @@ tr:hover td { background: #fafbfc; }
                   <strong>対応列：</strong> ユーザーID・表示名・タグ・友達追加日・メモ（列名は自動判定）
                 </p>
                 <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;">
-                  <input type="file" id="csv-file" accept=".csv" style="font-size:13px;">
-                  <button class="btn btn-green" onclick="uploadCsv()">📂 インポート</button>
+                  <input type="file" id="csv-file" accept=".csv" style="font-size:13px;" onchange="onCsvFileChange(this)">
+                  <span style="font-size:12px;color:var(--text-sub);">← ファイルを選ぶと列マッピングが表示されます</span>
                 </div>
                 <div id="csv-result" style="margin-top:12px;"></div>
               </div>

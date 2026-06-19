@@ -3,7 +3,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Request, Header
+from fastapi import FastAPI, HTTPException, Depends, Request, Header, Query
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -1020,7 +1020,14 @@ def import_scenario(cid: int, body: ScenarioImportBody, s=Depends(get_session)):
 
 
 @app.post("/api/companies/{cid}/import/followers-csv")
-async def import_followers_csv(cid: int, request: Request, s=Depends(get_session)):
+async def import_followers_csv(
+    cid: int, request: Request, s=Depends(get_session),
+    col_uid:  str = Query(None),
+    col_name: str = Query(None),
+    col_tags: str = Query(None),
+    col_date: str = Query(None),
+    col_memo: str = Query(None)
+):
     """CSVからフォロワーをインポート（かんたんLINEステップのエクスポートCSV対応）
     
     必須列: line_user_id（またはユーザーID/userId/user_id）
@@ -1054,11 +1061,16 @@ async def import_followers_csv(cid: int, request: Request, s=Depends(get_session
         return None
 
     headers = reader.fieldnames or []
-    col_uid  = find_col(headers, COL_USER_ID)
-    col_name = find_col(headers, COL_NAME)
-    col_tags = find_col(headers, COL_TAGS)
-    col_date = find_col(headers, COL_DATE)
-    col_memo = find_col(headers, COL_MEMO)
+    # If caller passes explicit column names (from UI mapper), use them; otherwise auto-detect
+    col_uid  = col_uid  or find_col(headers, COL_USER_ID)
+    col_name = col_name or find_col(headers, COL_NAME)
+    col_tags = col_tags or find_col(headers, COL_TAGS)
+    col_date = col_date or find_col(headers, COL_DATE)
+    col_memo = col_memo or find_col(headers, COL_MEMO)
+    # Return column info if headers_only requested
+    if not col_uid:
+        # Try first matching header that starts with U (may be user id column label)
+        pass
 
     if not col_uid:
         conn.close()
